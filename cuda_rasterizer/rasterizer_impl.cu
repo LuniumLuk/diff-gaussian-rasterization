@@ -218,8 +218,10 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* out_cm1,
 	float* out_cm2,
+	int* out_N,
 	int* radii,
-	bool debug)
+	bool debug,
+	int ch)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -241,9 +243,14 @@ int CudaRasterizer::Rasterizer::forward(
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
-	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	if (ch != 3 && colors_precomp == nullptr)
 	{
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
+	}
+
+	if (ch >= MAX_CHENNELS)
+	{
+		throw std::runtime_error("Exceed the max channels!");
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
@@ -271,7 +278,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		ch
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
@@ -334,7 +342,9 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		out_cm1,
-		out_cm2), debug)
+		out_cm2,
+		out_N,
+		ch), debug)
 
 	return num_rendered;
 }
@@ -361,6 +371,9 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,
 	char* img_buffer,
 	const float* dL_dpix,
+	const float* dL_dcm1,
+	const float* dL_dcm2,
+	const int* color_N,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
@@ -370,7 +383,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
-	bool debug)
+	bool debug,
+	int ch)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -404,10 +418,14 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		dL_dcm1,
+		dL_dcm2,
+		color_N,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		ch), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -434,5 +452,6 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		ch), debug)
 }

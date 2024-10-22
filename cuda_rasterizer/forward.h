@@ -45,7 +45,8 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		int ch);
 
 	// Main rasterization method.
 	void render(
@@ -61,7 +62,9 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* out_cm1,
-		float* out_cm2);
+		float* out_cm2,
+		int* out_N,
+		int ch);
 }
 
 

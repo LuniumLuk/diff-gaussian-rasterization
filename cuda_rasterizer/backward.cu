@@ -361,7 +361,8 @@ __global__ void preprocessCUDA(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	int NUM_CH)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -409,10 +410,14 @@ renderCUDA(
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dcm1s,
+	const float* __restrict__ dL_dcm2s,
+	const int* __restrict__ color_Ns,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	int NUM_CH)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -448,10 +453,19 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
+	float dL_dcm1[C];
+	float dL_dcm2[C];
+	int cm0[C];
 	if (inside)
-		for (int i = 0; i < C; i++)
+	{
+		for (int i = 0; i < NUM_CH; i++)
+		{
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
-
+			dL_dcm1[i] = dL_dcm1s[i * H * W + pix_id];
+			dL_dcm2[i] = dL_dcm2s[i * H * W + pix_id];
+			cm0[i] = color_Ns[i * H * W + pix_id];
+		}
+	}
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 
@@ -473,8 +487,8 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			for (int i = 0; i < C; i++)
-				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int i = 0; i < NUM_CH; i++)
+				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * NUM_CH + i];
 		}
 		block.sync();
 
@@ -508,7 +522,7 @@ renderCUDA(
 			// pair).
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
-			for (int ch = 0; ch < C; ch++)
+			for (int ch = 0; ch < NUM_CH; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
 				// Update last color (to be used in the next iteration)
@@ -520,7 +534,15 @@ renderCUDA(
 				// Update the gradients w.r.t. color of the Gaussian.
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				float dL_dcolor = 0.0f;
+				const int c_N = max(1, cm0[ch]);
+				dL_dcolor += dchannel_dcolor * dL_dchannel;
+				// Update gradients from color moments
+				const float dcm1_dcolor = 1.0f / (float)c_N;
+				dL_dcolor += dcm1_dcolor * dL_dcm1[ch];
+				const float dcm2_dcolor = 2.0f * c / (float)c_N;
+				dL_dcolor += dcm2_dcolor * dL_dcm2[ch];
+				atomicAdd(&(dL_dcolors[global_id * NUM_CH + ch]), dL_dcolor);
 			}
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
@@ -529,7 +551,7 @@ renderCUDA(
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
 			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
+			for (int i = 0; i < NUM_CH; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
@@ -578,7 +600,8 @@ void BACKWARD::preprocess(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	int ch)
 {
 	// Propagate gradients for the path of 2D conic matrix computation.
 	// Somewhat long, thus it is its own kernel rather than being part of
@@ -601,7 +624,7 @@ void BACKWARD::preprocess(
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
+	preprocessCUDA<MAX_CHENNELS> << < (P + 255) / 256, 256 >> > (
 		P, D, M,
 		(float3*)means3D,
 		radii,
@@ -618,7 +641,8 @@ void BACKWARD::preprocess(
 		dL_dcov3D,
 		dL_dsh,
 		dL_dscale,
-		dL_drot);
+		dL_drot,
+		ch);
 }
 
 void BACKWARD::render(
@@ -633,12 +657,16 @@ void BACKWARD::render(
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dcm1s,
+	const float* dL_dcm2s,
+	const int* color_Ns,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	int ch)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<MAX_CHENNELS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -649,9 +677,13 @@ void BACKWARD::render(
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dcm1s,
+		dL_dcm2s,
+		color_Ns,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		ch
 		);
 }
